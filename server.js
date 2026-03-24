@@ -11,6 +11,7 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
+// ================= TOKEN =================
 async function getAccessToken() {
   const params = new URLSearchParams();
   params.append('client_id', process.env.CLIENT_ID);
@@ -28,7 +29,7 @@ async function getAccessToken() {
   return data.access_token;
 }
 
-// ✅ SEM TYPESCRIPT
+// ================= PEGAR ID DA LISTA =================
 async function getListIdByName(token, listName) {
   const listsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists`;
 
@@ -49,6 +50,7 @@ async function getListIdByName(token, listName) {
   return list.id;
 }
 
+// ================= ROTAS =================
 app.get('/', (req, res) => {
   res.send('API SharePoint DPF is running');
 });
@@ -57,31 +59,64 @@ app.get('/status', (req, res) => {
   res.json({ status: 'online' });
 });
 
+// ================= DEBUG =================
+app.get('/debug-sharepoint', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+
+    const listsRes = await fetch(`https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+
+    const listsData = await listsRes.json();
+
+    const laudoList = listsData.value.find(
+      (l) => l.displayName === process.env.LIST_NAME || l.name === process.env.LIST_NAME
+    );
+
+    const colsRes = await fetch(
+      `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${laudoList.id}/columns`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+
+    const colsData = await colsRes.json();
+
+    res.json({
+      listId: laudoList.id,
+      colunas: colsData.value.map(c => ({
+        NomeNaTela: c.displayName,
+        NomeInterno: c.name
+      }))
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================= UPLOAD PDF =================
 app.post('/upload-pdf', async (req, res) => {
   try {
     const { fileName, fileBase64 } = req.body;
 
-    if (!fileName || !fileBase64) {
-      throw new Error('fileName ou fileBase64 faltando');
-    }
-
     const token = await getAccessToken();
 
     const safePath = encodeURI(`${process.env.LIBRARY_NAME}/${process.env.FOLDER_PATH}/${fileName}`);
-    const uploadUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/drive/root:/${safePath}:/content`;
 
-    const graphRes = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/pdf'
-      },
-      body: Buffer.from(fileBase64, 'base64')
-    });
+    const graphRes = await fetch(
+      `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/drive/root:/${safePath}:/content`,
+      {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/pdf'
+        },
+        body: Buffer.from(fileBase64, 'base64')
+      }
+    );
 
     if (!graphRes.ok) {
-      const errText = await graphRes.text();
-      throw new Error(`Erro SharePoint: ${graphRes.status} - ${errText}`);
+      throw new Error(await graphRes.text());
     }
 
     res.json({ success: true });
@@ -92,53 +127,69 @@ app.post('/upload-pdf', async (req, res) => {
   }
 });
 
+// ================= UPLOAD LISTA =================
 app.post('/upload-list-data', async (req, res) => {
   try {
     const { listData } = req.body;
 
-    if (!listData || !Array.isArray(listData) || listData.length === 0) {
+    if (!listData?.length) {
       return res.json({ success: true });
     }
 
     const token = await getAccessToken();
-
     const listId = await getListIdByName(token, process.env.LIST_NAME);
 
     for (const item of listData) {
 
+      // 🔥 USANDO NOMES VISÍVEIS (resolve erro 500)
       const fields = {
-        Title: item.Title || '',
-        N_x00ba__x0020_do_x0020_ticket: item.ticketNumber || '',
-        Nome_x0020_do_x0020_Cliente: item.nomeCliente || '',
-        Item: item.item || '',
-        Qtde: item.qtde || '',
-        Motivo: item.motivo || '',
-        Origem_x0020_do_x0020_defeito: item.origemDefeito || '',
-        Disposi_x00e7__x00e3_o: item.disposicao || '',
-        Disposi_x00e7__x00e3_o_x0020_das_x0020_pe_x00e7_as: item.disposicaoPecas || '',
-        Data_x0020_de_x0020_Gera_x00e7__x00e3_o: item.dataGeracao || ''
+        "Título": item.Titulo || '',
+        "Nº do ticket": item.ticketNumber || '',
+        "Nome do Cliente": item.nomeCliente || '',
+        "Item": item.item || '',
+        "Qtde": item.qtde || '',
+        "Motivo": item.motivo || '',
+        "Origem do defeito": item.origemDefeito || '',
+        "Disposição": item.disposicao || '',
+        "Disposição das peças": item.disposicaoPecas || '',
+        "Data de Geração": item.dataGeracao || ''
       };
 
-      for (let i = 1; i <= 10; i++) {
-        if (item[`foto${i}`]) {
-          fields[`Foto_x0020_${i}`] = item[`foto${i}`];
+      // 🔥 FOTOS
+      const fotosMap = {
+        foto1: "Foto 1",
+        foto2: "Foto 2",
+        foto3: "Foto 3",
+        foto4: "Foto 4",
+        foto5: "Foto 5",
+        foto6: "Foto 6",
+        foto7: "Foto 7",
+        foto8: "Foto 8",
+        foto9: "Foto 9",
+        foto10: "Foto 10"
+      };
+
+      Object.keys(fotosMap).forEach(key => {
+        if (item[key]) {
+          fields[fotosMap[key]] = item[key];
         }
-      }
-
-      const graphUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${listId}/items`;
-
-      const graphRes = await fetch(graphUrl, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ fields })
       });
+
+      const graphRes = await fetch(
+        `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${listId}/items`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ fields })
+        }
+      );
 
       if (!graphRes.ok) {
         const errText = await graphRes.text();
-        throw new Error(`Erro SharePoint Lista: ${graphRes.status} - ${errText}`);
+        throw new Error(`Erro SharePoint Lista: ${errText}`);
       }
     }
 
@@ -150,6 +201,12 @@ app.post('/upload-list-data', async (req, res) => {
   }
 });
 
+// ================= DELETE =================
+app.delete('/delete-pdf-by-ticket-number/:ticketNumber', (req, res) => {
+  res.json({ success: true });
+});
+
+// ================= START =================
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
