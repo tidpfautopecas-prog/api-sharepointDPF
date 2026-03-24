@@ -11,11 +11,6 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
-console.log('🚀 API SharePoint DPF a iniciar...');
-console.log(`📁 Site: ${process.env.SITE_ID}`);
-console.log(`📂 Biblioteca: ${process.env.LIBRARY_NAME}`);
-console.log(`📍 Pasta: ${process.env.FOLDER_PATH}`);
-
 async function getAccessToken() {
   const params = new URLSearchParams();
   params.append('client_id', process.env.CLIENT_ID);
@@ -44,11 +39,17 @@ app.get('/status', (req, res) => {
 app.post('/upload-pdf', async (req, res) => {
   try {
     const { fileName, fileBase64 } = req.body;
+
+    if (!fileName || !fileBase64) {
+      throw new Error('fileName ou fileBase64 faltando no corpo da requisicao');
+    }
+
     const token = await getAccessToken();
 
-    const uploadUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/drive/root:/${process.env.LIBRARY_NAME}/${process.env.FOLDER_PATH}/${fileName}:/content`;
+    const safePath = encodeURI(`${process.env.LIBRARY_NAME}/${process.env.FOLDER_PATH}/${fileName}`);
+    const uploadUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/drive/root:/${safePath}:/content`;
 
-    await fetch(uploadUrl, {
+    const graphRes = await fetch(uploadUrl, {
       method: 'PUT',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -57,10 +58,15 @@ app.post('/upload-pdf', async (req, res) => {
       body: Buffer.from(fileBase64, 'base64')
     });
 
+    if (!graphRes.ok) {
+       const errText = await graphRes.text();
+       throw new Error(`Erro SharePoint: ${graphRes.status} - ${errText}`);
+    }
+
     res.json({ success: true });
 
   } catch (err) {
-    res.status(500).json({ success: false });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -74,6 +80,4 @@ app.delete('/delete-pdf-by-ticket-number/:ticketNumber', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🌐 Rodando na porta ${PORT}`);
-  console.log('✅ API SharePoint DPF pronta!');
 });
