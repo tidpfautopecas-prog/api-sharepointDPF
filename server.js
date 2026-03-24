@@ -28,6 +28,27 @@ async function getAccessToken() {
   return data.access_token;
 }
 
+// 🔥 FUNÇÃO PARA PEGAR ID REAL DA LISTA
+async function getListIdByName(token: string, listName: string) {
+  const listsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists`;
+
+  const res = await fetch(listsUrl, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  const data = await res.json();
+
+  const list = data.value?.find(
+    (l: any) => l.displayName === listName || l.name === listName
+  );
+
+  if (!list) {
+    throw new Error(`Lista '${listName}' não encontrada`);
+  }
+
+  return list.id;
+}
+
 app.get('/', (req, res) => {
   res.send('API SharePoint DPF is running');
 });
@@ -41,7 +62,7 @@ app.post('/upload-pdf', async (req, res) => {
     const { fileName, fileBase64 } = req.body;
 
     if (!fileName || !fileBase64) {
-      throw new Error('fileName ou fileBase64 faltando no corpo da requisicao');
+      throw new Error('fileName ou fileBase64 faltando');
     }
 
     const token = await getAccessToken();
@@ -59,13 +80,14 @@ app.post('/upload-pdf', async (req, res) => {
     });
 
     if (!graphRes.ok) {
-       const errText = await graphRes.text();
-       throw new Error(`Erro SharePoint: ${graphRes.status} - ${errText}`);
+      const errText = await graphRes.text();
+      throw new Error(`Erro SharePoint: ${graphRes.status} - ${errText}`);
     }
 
     res.json({ success: true });
 
-  } catch (err) {
+  } catch (err: any) {
+    console.error("ERRO PDF:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -79,12 +101,16 @@ app.post('/upload-list-data', async (req, res) => {
     }
 
     const token = await getAccessToken();
-    const listName = process.env.LIST_NAME;
+
+    // 🔥 CORREÇÃO: pegar ID da lista
+    const listId = await getListIdByName(token, process.env.LIST_NAME);
 
     for (const item of listData) {
+
+      // 🔥 CAMPOS CORRIGIDOS
       const fields = {
         Title: item.Title || '',
-        N_x00b0__x0020_do_x0020_ticket: item.ticketNumber || '',
+        N_x00ba__x0020_do_x0020_ticket: item.ticketNumber || '', // ✔️ CORRIGIDO (º)
         Nome_x0020_do_x0020_Cliente: item.nomeCliente || '',
         Item: item.item || '',
         Qtde: item.qtde || '',
@@ -95,13 +121,14 @@ app.post('/upload-list-data', async (req, res) => {
         Data_x0020_de_x0020_Gera_x00e7__x00e3_o: item.dataGeracao || ''
       };
 
+      // Fotos
       for (let i = 1; i <= 10; i++) {
         if (item[`foto${i}`]) {
           fields[`Foto_x0020_${i}`] = item[`foto${i}`];
         }
       }
 
-      const graphUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${listName}/items`;
+      const graphUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${listId}/items`;
 
       const graphRes = await fetch(graphUrl, {
         method: 'POST',
@@ -120,7 +147,8 @@ app.post('/upload-list-data', async (req, res) => {
 
     res.json({ success: true });
 
-  } catch (err) {
+  } catch (err: any) {
+    console.error("ERRO LISTA:", err); // 🔥 LOG REAL
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -133,36 +161,31 @@ app.get('/debug-sharepoint', async (req, res) => {
     const listsRes = await fetch(listsUrl, { headers: { Authorization: `Bearer ${token}` } });
     const listsData = await listsRes.json();
 
-    if (!listsData.value) {
-        return res.json({ error: "Não foi possível carregar as listas", detalhes: listsData });
-    }
-
-    const laudoList = listsData.value.find(l => l.displayName === 'Laudo' || l.name === 'Laudo');
+    const laudoList = listsData.value.find(
+      (l: any) => l.displayName === process.env.LIST_NAME || l.name === process.env.LIST_NAME
+    );
 
     if (!laudoList) {
-       return res.json({ 
-         aviso: "Lista 'Laudo' não encontrada com esse nome exato.", 
-         listasDisponiveis: listsData.value.map(l => l.displayName) 
-       });
+      return res.json({
+        erro: "Lista não encontrada",
+        listas: listsData.value.map((l: any) => l.displayName)
+      });
     }
 
     const colsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${laudoList.id}/columns`;
     const colsRes = await fetch(colsUrl, { headers: { Authorization: `Bearer ${token}` } });
     const colsData = await colsRes.json();
 
-    const colunasMapeadas = colsData.value.map(c => ({
-        NomeNaTela: c.displayName,
-        NomeInternoParaAPI: c.name
-    }));
-
     res.json({
-      sucesso: true,
       listId: laudoList.id,
-      colunas: colunasMapeadas
+      colunas: colsData.value.map((c: any) => ({
+        NomeNaTela: c.displayName,
+        NomeInterno: c.name
+      }))
     });
 
-  } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -172,4 +195,5 @@ app.delete('/delete-pdf-by-ticket-number/:ticketNumber', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
