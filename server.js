@@ -21,7 +21,6 @@ app.use(bodyParser.json({ limit: '50mb' }));
 
 console.log('🚀 API SharePoint DPF a iniciar...');
 
-// Mapeamento idêntico ao da Global Plastic, que já possui os Nomes Internos corretos do SharePoint
 const COLUMN_MAPPING = {
     'Title': (row) => row.Title,
     'N_x00b0_doticket': (row) => row.ticketNumber,
@@ -93,6 +92,49 @@ async function getListId(accessToken) {
 app.get('/', (req, res) => res.json({ status: 'online', timestamp: new Date().toISOString() }));
 
 app.get('/status', (req, res) => res.json({ status: 'online' }));
+
+// --- ROTA DE DEBUG RESTAURADA AQUI ---
+app.get('/debug-sharepoint', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+
+    const listsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists`;
+    const listsRes = await fetch(listsUrl, { headers: { Authorization: `Bearer ${token}` } });
+    const listsData = await listsRes.json();
+
+    if (!listsData.value) {
+        return res.json({ error: "Não foi possível carregar as listas", detalhes: listsData });
+    }
+
+    const laudoList = listsData.value.find(l => l.displayName === 'Laudo' || l.name === 'Laudo');
+
+    if (!laudoList) {
+       return res.json({ 
+         aviso: "Lista 'Laudo' não encontrada com esse nome exato.", 
+         listasDisponiveis: listsData.value.map(l => l.displayName) 
+       });
+    }
+
+    const colsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${laudoList.id}/columns`;
+    const colsRes = await fetch(colsUrl, { headers: { Authorization: `Bearer ${token}` } });
+    const colsData = await colsRes.json();
+
+    const colunasMapeadas = colsData.value.map(c => ({
+        NomeNaTela: c.displayName,
+        NomeInternoParaAPI: c.name
+    }));
+
+    res.json({
+      sucesso: true,
+      listId: laudoList.id,
+      colunas: colunasMapeadas
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+// ------------------------------------
 
 app.get('/check-status/:ticketNumber', async (req, res) => {
     const { ticketNumber } = req.params;
