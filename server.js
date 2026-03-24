@@ -28,8 +28,8 @@ async function getAccessToken() {
   return data.access_token;
 }
 
-// 🔥 FUNÇÃO PARA PEGAR ID REAL DA LISTA
-async function getListIdByName(token: string, listName: string) {
+// ✅ SEM TYPESCRIPT
+async function getListIdByName(token, listName) {
   const listsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists`;
 
   const res = await fetch(listsUrl, {
@@ -39,7 +39,7 @@ async function getListIdByName(token: string, listName: string) {
   const data = await res.json();
 
   const list = data.value?.find(
-    (l: any) => l.displayName === listName || l.name === listName
+    (l) => l.displayName === listName || l.name === listName
   );
 
   if (!list) {
@@ -86,7 +86,7 @@ app.post('/upload-pdf', async (req, res) => {
 
     res.json({ success: true });
 
-  } catch (err: any) {
+  } catch (err) {
     console.error("ERRO PDF:", err);
     res.status(500).json({ success: false, error: err.message });
   }
@@ -102,15 +102,13 @@ app.post('/upload-list-data', async (req, res) => {
 
     const token = await getAccessToken();
 
-    // 🔥 CORREÇÃO: pegar ID da lista
     const listId = await getListIdByName(token, process.env.LIST_NAME);
 
     for (const item of listData) {
 
-      // 🔥 CAMPOS CORRIGIDOS
       const fields = {
         Title: item.Title || '',
-        N_x00ba__x0020_do_x0020_ticket: item.ticketNumber || '', // ✔️ CORRIGIDO (º)
+        N_x00ba__x0020_do_x0020_ticket: item.ticketNumber || '',
         Nome_x0020_do_x0020_Cliente: item.nomeCliente || '',
         Item: item.item || '',
         Qtde: item.qtde || '',
@@ -121,7 +119,6 @@ app.post('/upload-list-data', async (req, res) => {
         Data_x0020_de_x0020_Gera_x00e7__x00e3_o: item.dataGeracao || ''
       };
 
-      // Fotos
       for (let i = 1; i <= 10; i++) {
         if (item[`foto${i}`]) {
           fields[`Foto_x0020_${i}`] = item[`foto${i}`];
@@ -147,50 +144,10 @@ app.post('/upload-list-data', async (req, res) => {
 
     res.json({ success: true });
 
-  } catch (err: any) {
-    console.error("ERRO LISTA:", err); // 🔥 LOG REAL
+  } catch (err) {
+    console.error("ERRO LISTA:", err);
     res.status(500).json({ success: false, error: err.message });
   }
-});
-
-app.get('/debug-sharepoint', async (req, res) => {
-  try {
-    const token = await getAccessToken();
-
-    const listsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists`;
-    const listsRes = await fetch(listsUrl, { headers: { Authorization: `Bearer ${token}` } });
-    const listsData = await listsRes.json();
-
-    const laudoList = listsData.value.find(
-      (l: any) => l.displayName === process.env.LIST_NAME || l.name === process.env.LIST_NAME
-    );
-
-    if (!laudoList) {
-      return res.json({
-        erro: "Lista não encontrada",
-        listas: listsData.value.map((l: any) => l.displayName)
-      });
-    }
-
-    const colsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${laudoList.id}/columns`;
-    const colsRes = await fetch(colsUrl, { headers: { Authorization: `Bearer ${token}` } });
-    const colsData = await colsRes.json();
-
-    res.json({
-      listId: laudoList.id,
-      colunas: colsData.value.map((c: any) => ({
-        NomeNaTela: c.displayName,
-        NomeInterno: c.name
-      }))
-    });
-
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/delete-pdf-by-ticket-number/:ticketNumber', (req, res) => {
-  res.json({ success: true });
 });
 
 const PORT = process.env.PORT || 3001;
