@@ -19,6 +19,9 @@ app.options('*', cors());
 
 app.use(bodyParser.json({ limit: '50mb' }));
 
+console.log('🚀 API SharePoint DPF a iniciar...');
+
+// Mapeamento SEM o field_19 (Data de Geração)
 const COLUMN_MAPPING = {
     'Title': (row) => row.Title,
     'field_1': (row) => row.ticketNumber,
@@ -39,7 +42,7 @@ const COLUMN_MAPPING = {
     'field_16': (row) => row.foto8 || null,
     'field_17': (row) => row.foto9 || null,
     'field_18': (row) => row.foto10 || null,
-    'field_19': (row) => row.dataGeracao || ''
+    'field_22': (row) => row.responsavel // <-- Coluna Responsável
 };
 
 async function getAccessToken(retries = 3) {
@@ -58,7 +61,7 @@ async function getAccessToken(retries = 3) {
       });
       
       const data = await res.json();
-      if (!data.access_token) throw new Error();
+      if (!data.access_token) throw new Error(`Erro na autenticação: ${data.error_description || data.error}`);
       return data.access_token;
     } catch (error) {
       if (i === retries - 1) throw error;
@@ -70,10 +73,10 @@ async function getAccessToken(retries = 3) {
 async function getDriveId(accessToken) {
     const url = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/drives`;
     const res = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
-    if (!res.ok) throw new Error();
+    if (!res.ok) throw new Error(`Erro ao buscar drives: ${res.status}`);
     const { value: drives } = await res.json();
     const library = drives.find(d => d.name === process.env.LIBRARY_NAME);
-    if (!library) throw new Error();
+    if (!library) throw new Error(`Biblioteca "${process.env.LIBRARY_NAME}" não encontrada.`);
     return library.id;
 }
 
@@ -81,15 +84,34 @@ async function getListId(accessToken) {
     const listName = process.env.LIST_NAME || "Laudo";
     const url = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists?$filter=displayName eq '${encodeURIComponent(listName)}'`;
     const res = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
-    if (!res.ok) throw new Error();
+    if (!res.ok) throw new Error(`Erro ao buscar listas: ${res.status}`);
     const { value: lists } = await res.json();
     if (lists.length > 0) return lists[0].id;
-    throw new Error();
+    throw new Error(`Lista "${listName}" não encontrada.`);
 }
 
-app.get('/', (req, res) => res.json({ status: 'online' }));
+app.get('/', (req, res) => res.json({ status: 'online', timestamp: new Date().toISOString() }));
 
 app.get('/status', (req, res) => res.json({ status: 'online' }));
+
+app.get('/debug-sharepoint', async (req, res) => {
+  try {
+    const token = await getAccessToken();
+    const listsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists`;
+    const listsRes = await fetch(listsUrl, { headers: { Authorization: `Bearer ${token}` } });
+    const listsData = await listsRes.json();
+    if (!listsData.value) return res.json({ error: "Não foi possível carregar as listas", detalhes: listsData });
+    const laudoList = listsData.value.find(l => l.displayName === 'Laudo' || l.name === 'Laudo');
+    if (!laudoList) return res.json({ aviso: "Lista 'Laudo' não encontrada.", listasDisponiveis: listsData.value.map(l => l.displayName) });
+    const colsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${laudoList.id}/columns`;
+    const colsRes = await fetch(colsUrl, { headers: { Authorization: `Bearer ${token}` } });
+    const colsData = await colsRes.json();
+    const colunasMapeadas = colsData.value.map(c => ({ NomeNaTela: c.displayName, NomeInternoParaAPI: c.name }));
+    res.json({ sucesso: true, listId: laudoList.id, colunas: colunasMapeadas });
+  } catch (err) {
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
 
 app.get('/check-status/:ticketNumber', async (req, res) => {
     const { ticketNumber } = req.params;
@@ -118,9 +140,7 @@ app.get('/check-status/:ticketNumber', async (req, res) => {
             const data = await driveRes.json();
             existsInPdf = data.value && data.value.some(f => f.name.includes(ticketNumber) && f.name.endsWith('.pdf'));
         }
-
         res.json({ existsInList, existsInPdf });
-
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -143,7 +163,7 @@ app.post('/upload-pdf', async (req, res) => {
       body: Buffer.from(fileBase64, 'base64')
     });
 
-    if (!response.ok) throw new Error();
+    if (!response.ok) throw new Error(`SharePoint Error ${response.status}`);
     const result = await response.json();
     res.status(200).json({ success: true, sharePointUrl: result.webUrl });
   } catch (error) {
@@ -175,7 +195,7 @@ app.post('/upload-list-data', async (req, res) => {
 
             if (!itemResponse.ok) {
                 const errText = await itemResponse.text();
-                throw new Error(errText);
+                throw new Error(`Erro na Coluna: ${errText}`);
             }
             return itemResponse.json();
         });
@@ -183,6 +203,7 @@ app.post('/upload-list-data', async (req, res) => {
         await Promise.all(insertionPromises);
         res.status(200).json({ success: true });
     } catch (error) {
+        console.error(`❌ Erro upload lista:`, error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -213,5 +234,14 @@ app.delete('/delete-pdf-by-ticket-number/:ticketNumber', async (req, res) => {
     }
 });
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {});
+app.delete('/delete-list-data-by-ticket-number/:ticketNumber', async (req, res) => {
+    const { ticketNumber } = req.params;
+    if (!ticketNumber) return res.status(400).json({ error: 'Ticket obrigatório' });
+
+    try {
+        const accessToken = await getAccessToken();
+        const listId = await getListId(accessToken);
+        const siteId = process.env.SITE_ID;
+        
+        const listUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items?expand=fields&$top=5000`;
+        const listResponse = await fetch(listUrl, { headers: { '
