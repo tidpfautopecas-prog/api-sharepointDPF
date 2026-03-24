@@ -11,7 +11,6 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// ✅ ESTÉTICA DPF
 console.log('🚀 API SharePoint DPF a iniciar...');
 console.log(`📁 Site: ${process.env.SITE_ID}`);
 console.log(`📂 Biblioteca: ${process.env.LIBRARY_NAME}`);
@@ -34,12 +33,14 @@ async function getAccessToken() {
   return data.access_token;
 }
 
-// STATUS
+app.get('/', (req, res) => {
+  res.send('API SharePoint DPF is running');
+});
+
 app.get('/status', (req, res) => {
   res.json({ status: 'online' });
 });
 
-// UPLOAD PDF
 app.post('/upload-pdf', async (req, res) => {
   try {
     const { fileName, fileBase64 } = req.body;
@@ -63,12 +64,10 @@ app.post('/upload-pdf', async (req, res) => {
   }
 });
 
-// UPLOAD LISTA (dummy - mantém compatibilidade)
 app.post('/upload-list-data', async (req, res) => {
   res.json({ success: true });
 });
 
-// DELETE PDF
 app.delete('/delete-pdf-by-ticket-number/:ticketNumber', (req, res) => {
   res.json({ success: true });
 });
