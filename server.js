@@ -1,247 +1,486 @@
-import express from 'express';
-import bodyParser from 'body-parser';
-import fetch from 'node-fetch';
-import dotenv from 'dotenv';
-import cors from 'cors';
+import jsPDF from 'jspdf';
+import type { Ticket } from '../pages/laudos/page';
+import { supabase } from './supabaseClient';
 
-dotenv.config();
+const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+const STORAGE_BUCKET = 'fotos-laudos';
 
-const app = express();
-
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
-    credentials: true
-}));
-
-app.options('*', cors()); 
-
-app.use(bodyParser.json({ limit: '50mb' }));
-
-console.log('🚀 API SharePoint DPF a iniciar...');
-
-// Mapeamento SEM o field_19 (Data de Geração)
-const COLUMN_MAPPING = {
-    'Title': (row) => row.Title,
-    'field_1': (row) => row.ticketNumber,
-    'field_2': (row) => row.nomeCliente,
-    'field_3': (row) => row.item,
-    'field_4': (row) => String(row.qtde),
-    'field_5': (row) => row.motivo,
-    'field_6': (row) => row.origemDefeito,
-    'field_7': (row) => row.disposicao,
-    'field_8': (row) => row.disposicaoPecas,
-    'field_9': (row) => row.foto1 || null,
-    'field_10': (row) => row.foto2 || null,
-    'field_11': (row) => row.foto3 || null,
-    'field_12': (row) => row.foto4 || null,
-    'field_13': (row) => row.foto5 || null,
-    'field_14': (row) => row.foto6 || null,
-    'field_15': (row) => row.foto7 || null,
-    'field_16': (row) => row.foto8 || null,
-    'field_17': (row) => row.foto9 || null,
-    'field_18': (row) => row.foto10 || null,
-    'field_22': (row) => row.responsavel // <-- Coluna Responsável
-};
-
-async function getAccessToken(retries = 3) {
-  for (let i = 0; i < retries; i++) {
+async function fetchImageAsBase64(path: string): Promise<string> {
     try {
-      const params = new URLSearchParams();
-      params.append('client_id', process.env.CLIENT_ID);
-      params.append('scope', 'https://graph.microsoft.com/.default');
-      params.append('client_secret', process.env.CLIENT_SECRET);
-      params.append('grant_type', 'client_credentials');
-      
-      const res = await fetch(`https://login.microsoftonline.com/${process.env.TENANT_ID}/oauth2/v2.0/token`, {
-        method: 'POST',
-        body: params,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-      });
-      
-      const data = await res.json();
-      if (!data.access_token) throw new Error(`Erro na autenticação: ${data.error_description || data.error}`);
-      return data.access_token;
+        const { data: blob, error: downloadError } = await supabase
+            .storage
+            .from(STORAGE_BUCKET)
+            .download(path);
+
+        if (downloadError) throw downloadError;
+
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
     } catch (error) {
-      if (i === retries - 1) throw error;
-      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+        return '';
+    }
+}
+
+export class PDFGenerator {
+  private static instance: PDFGenerator;
+  private toastCallback: ((type: 'success' | 'error' | 'info' | 'warning', title: string, message?: string) => void) | null = null;
+  private apiUrl: string = "https://api-sharepointdpf.onrender.com";
+
+  public static getInstance(): PDFGenerator {
+    if (!PDFGenerator.instance) {
+      PDFGenerator.instance = new PDFGenerator();
+    }
+    return PDFGenerator.instance;
+  }
+
+  setApiUrl = (url: string) => {
+    this.apiUrl = url;
+  }
+  
+  setToastCallback = (callback: (type: 'success' | 'error' | 'info' | 'warning', title: string, message?: string) => void) => {
+    this.toastCallback = callback;
+  }
+
+  private showToast = (type: 'success' | 'error' | 'info' | 'warning', title: string, message?: string) => {
+    if (this.toastCallback) {
+        this.toastCallback(type, title, message);
     }
   }
-}
 
-async function getDriveId(accessToken) {
-    const url = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/drives`;
-    const res = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
-    if (!res.ok) throw new Error(`Erro ao buscar drives: ${res.status}`);
-    const { value: drives } = await res.json();
-    const library = drives.find(d => d.name === process.env.LIBRARY_NAME);
-    if (!library) throw new Error(`Biblioteca "${process.env.LIBRARY_NAME}" não encontrada.`);
-    return library.id;
-}
-
-async function getListId(accessToken) {
-    const listName = process.env.LIST_NAME || "Laudo";
-    const url = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists?$filter=displayName eq '${encodeURIComponent(listName)}'`;
-    const res = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
-    if (!res.ok) throw new Error(`Erro ao buscar listas: ${res.status}`);
-    const { value: lists } = await res.json();
-    if (lists.length > 0) return lists[0].id;
-    throw new Error(`Lista "${listName}" não encontrada.`);
-}
-
-app.get('/', (req, res) => res.json({ status: 'online', timestamp: new Date().toISOString() }));
-
-app.get('/status', (req, res) => res.json({ status: 'online' }));
-
-app.get('/debug-sharepoint', async (req, res) => {
-  try {
-    const token = await getAccessToken();
-    const listsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists`;
-    const listsRes = await fetch(listsUrl, { headers: { Authorization: `Bearer ${token}` } });
-    const listsData = await listsRes.json();
-    if (!listsData.value) return res.json({ error: "Não foi possível carregar as listas", detalhes: listsData });
-    const laudoList = listsData.value.find(l => l.displayName === 'Laudo' || l.name === 'Laudo');
-    if (!laudoList) return res.json({ aviso: "Lista 'Laudo' não encontrada.", listasDisponiveis: listsData.value.map(l => l.displayName) });
-    const colsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${laudoList.id}/columns`;
-    const colsRes = await fetch(colsUrl, { headers: { Authorization: `Bearer ${token}` } });
-    const colsData = await colsRes.json();
-    const colunasMapeadas = colsData.value.map(c => ({ NomeNaTela: c.displayName, NomeInternoParaAPI: c.name }));
-    res.json({ sucesso: true, listId: laudoList.id, colunas: colunasMapeadas });
-  } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
+  setSharePointConfig = (siteUrl: string, libraryName: string) => {
+    const config = { siteUrl, libraryName };
+    localStorage.setItem('sharePointConfig', JSON.stringify(config));
   }
-});
 
-app.get('/check-status/:ticketNumber', async (req, res) => {
-    const { ticketNumber } = req.params;
+  getSharePointConfig = (): { siteUrl: string, libraryName: string } | null => {
+    const config = localStorage.getItem('sharePointConfig');
+    return config ? JSON.parse(config) : null;
+  }
+
+  setDefaultNetworkPath = (path: string) => {
+    localStorage.setItem('defaultNetworkPath', path);
+  }
+
+  getDefaultNetworkPath = (): string | null => {
+    return localStorage.getItem('defaultNetworkPath');
+  }
+
+  syncSmartTicket = async (ticket: Ticket): Promise<string> => {
     try {
-        const accessToken = await getAccessToken();
-        const siteId = process.env.SITE_ID;
-        const driveId = await getDriveId(accessToken);
-        const listId = await getListId(accessToken);
-
-        const listUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items?$filter=fields/field_1 eq '${ticketNumber}'`;
-        const listRes = await fetch(listUrl, { headers: { 'Authorization': `Bearer ${accessToken}`, 'Prefer': 'HonorNonIndexedQueriesWarningMayFailRandomly' } });
+        const cleanTicket = ticket.numero.replace(/[^a-zA-Z0-9-]/g, '');
+        const statusRes = await fetch(`${this.apiUrl}/check-status/${cleanTicket}`);
         
-        let existsInList = false;
-        if (listRes.ok) {
-             const data = await listRes.json();
-             existsInList = data.value && data.value.length > 0;
+        let needsPdf = true;
+
+        if (statusRes.ok) {
+            const status = await statusRes.json();
+            needsPdf = !status.existsInPdf;
         }
 
-        const encodedFolder = encodeURIComponent(process.env.FOLDER_PATH);
-        const pdfNamePart = `Laudo - ${ticketNumber}-`;
-        const driveUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${encodedFolder}:/search(q='${pdfNamePart}')`;
-        const driveRes = await fetch(driveUrl, { headers: { 'Authorization': `Bearer ${accessToken}` } });
-        
-        let existsInPdf = false;
-        if (driveRes.ok) {
-            const data = await driveRes.json();
-            existsInPdf = data.value && data.value.some(f => f.name.includes(ticketNumber) && f.name.endsWith('.pdf'));
+        if (!needsPdf) {
+            return 'Ignorado (Já existe)';
         }
-        res.json({ existsInList, existsInPdf });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+
+        const actions = [];
+
+        if (needsPdf) {
+            await this.generateAndUploadOnlyPdf(ticket);
+            actions.push('PDF');
+        }
+
+        return `Sincronizado: ${actions.join(' e ')}`;
+
+    } catch (error: any) {
+        throw error;
     }
-});
-
-app.post('/upload-pdf', async (req, res) => {
-  const { fileName, fileBase64 } = req.body;
-  if (!fileName || !fileBase64) return res.status(400).json({ error: 'Dados incompletos' });
-
-  try {
-    const accessToken = await getAccessToken();
-    const driveId = await getDriveId(accessToken);
-    const encodedFolder = encodeURIComponent(process.env.FOLDER_PATH);
-    const encodedFileName = encodeURIComponent(fileName);
-    const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${encodedFolder}/${encodedFileName}:/content`;
-    
-    const response = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/pdf' },
-      body: Buffer.from(fileBase64, 'base64')
-    });
-
-    if (!response.ok) throw new Error(`SharePoint Error ${response.status}`);
-    const result = await response.json();
-    res.status(200).json({ success: true, sharePointUrl: result.webUrl });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
   }
-});
 
-app.post('/upload-list-data', async (req, res) => {
-    const { listData } = req.body;
-    if (!listData || listData.length === 0) return res.status(400).json({ success: false, error: 'Sem dados' });
-
+  deletePDFByTicketNumber = async (ticketNumber: string): Promise<void> => {
     try {
-        const accessToken = await getAccessToken();
-        const listId = await getListId(accessToken); 
-        const listItemsUrl = `https://graph.microsoft.com/v1.0/sites/${process.env.SITE_ID}/lists/${listId}/items`;
-
-        const insertionPromises = listData.map(async (row) => {
-            const itemFields = {};
-            for (const key in COLUMN_MAPPING) {
-                const val = COLUMN_MAPPING[key](row);
-                if (val !== null && val !== '' && val !== undefined) itemFields[key] = val;
-            }
-            
-            const itemResponse = await fetch(listItemsUrl, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ fields: itemFields })
-            });
-
-            if (!itemResponse.ok) {
-                const errText = await itemResponse.text();
-                throw new Error(`Erro na Coluna: ${errText}`);
-            }
-            return itemResponse.json();
+        const cleanTicketNumber = ticketNumber.replace(/[^a-zA-Z0-9-]/g, '');
+        const response = await fetch(`${this.apiUrl}/delete-pdf-by-ticket-number/${cleanTicketNumber}`, {
+            method: 'DELETE',
         });
 
-        await Promise.all(insertionPromises);
-        res.status(200).json({ success: true });
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Falha na API: Status ${response.status}. Resposta: ${errorText}`);
+        }
     } catch (error) {
-        console.error(`❌ Erro upload lista:`, error.message);
-        res.status(500).json({ success: false, error: error.message });
+        this.showToast('error', 'Erro ao remover PDF', 'O ficheiro pode não existir no SharePoint ou a API está offline.');
     }
-});
+  }
 
-app.delete('/delete-pdf-by-ticket-number/:ticketNumber', async (req, res) => {
-    const { ticketNumber } = req.params;
-    if (!ticketNumber) return res.status(400).json({ error: 'Ticket obrigatório' });
-
+  deleteListDataByTicketNumber = async (ticketNumber: string): Promise<void> => {
     try {
-        const accessToken = await getAccessToken();
-        const driveId = await getDriveId(accessToken);
-        const encodedFolder = encodeURIComponent(process.env.FOLDER_PATH);
-        const listUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${encodedFolder}:/children`;
-        
-        const listResponse = await fetch(listUrl, { headers: { 'Authorization': `Bearer ${accessToken}` } });
-        if (!listResponse.ok) throw new Error();
-        const { value: allFiles } = await listResponse.json();
-        
-        const filesToDelete = allFiles.filter(file => file.name.startsWith(`Laudo - ${ticketNumber}-`));
-        if (filesToDelete.length === 0) return res.json({ success: true, message: 'Nada a excluir.' });
+        const cleanTicketNumber = ticketNumber.replace(/[^a-zA-Z0-9-]/g, '');
+        const response = await fetch(`${this.apiUrl}/delete-list-data-by-ticket-number/${cleanTicketNumber}`, {
+            method: 'DELETE',
+        });
 
-        await Promise.all(filesToDelete.map(file => 
-            fetch(`https://graph.microsoft.com/v1.0/drives/${driveId}/items/${file.id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${accessToken}` } })
-        ));
-        res.status(200).json({ success: true });
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Falha na API: Status ${response.status}. Resposta: ${errorText}`);
+        }
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        this.showToast('error', 'Erro ao remover itens da lista', 'A API pode estar offline ou o SharePoint negou o acesso.');
     }
-});
+  }
 
-app.delete('/delete-list-data-by-ticket-number/:ticketNumber', async (req, res) => {
-    const { ticketNumber } = req.params;
-    if (!ticketNumber) return res.status(400).json({ error: 'Ticket obrigatório' });
-
+  clearSharePointList = async (): Promise<void> => {
     try {
-        const accessToken = await getAccessToken();
-        const listId = await getListId(accessToken);
-        const siteId = process.env.SITE_ID;
+      const response = await fetch(`${this.apiUrl}/clear-list`, {
+        method: 'DELETE',
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Falha na API: Status ${response.status}. Resposta: ${errorText}`);
+      }
+      
+      this.showToast('success', 'Lista limpa com sucesso');
+    } catch (error) {
+      this.showToast('error', 'Erro ao limpar lista', 'A API pode estar offline ou o SharePoint negou o acesso.');
+      throw error;
+    }
+  }
+
+  saveReportToSharePoint = async (pdf: jsPDF, fileName: string): Promise<void> => {
+    const fileBase64 = pdf.output('datauristring').split(',')[1];
+    await this.uploadWithRetries('upload-pdf', { fileName, fileBase64: fileBase64, isReport: true });
+  }
+
+  generateTicketPDF = async (ticket: Ticket, userName: string): Promise<void> => {
+    try {
+        const pdf = new jsPDF('p', 'mm', 'a4');
+        const w = pdf.internal.pageSize.getWidth();
+        const h = pdf.internal.pageSize.getHeight();
+        let y = 15;
+
+        this.addHeader(pdf, w, y);
+        y += 20;
+        y = this.addTicketInfo(pdf, ticket, y, w);
+        y += 10;
+        if (ticket.itens && ticket.itens.length > 0) {
+            y = await this.addItemsList(pdf, ticket.itens, y, w, h);
+        }
+        this.addFooter(pdf, w, h, userName);
         
-        const listUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${listId}/items?expand=fields&$top=5000`;
-        const listResponse = await fetch(listUrl, { headers: { '
+        const fileName = this.generateFileName(ticket.numero);
+        const fileBase64 = pdf.output('datauristring').split(',')[1];
+
+        await this.uploadWithRetries('upload-pdf', {
+            fileName: fileName,
+            fileBase64: fileBase64,
+            ticketNumber: ticket.numero,
+            ticketTitle: ticket.titulo,
+            isReport: false,
+        });
+
+        // Gerando a Data e Hora no formato limpo para o SharePoint exibir por extenso
+        const agora = new Date();
+        const dataGeracaoFormatada = `${agora.toLocaleDateString('pt-BR')} ${agora.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`;
+
+        const listData = ticket.itens ? ticket.itens.map(item => {
+            const rowData: any = {
+                Title: `Laudo ${ticket.numero} - Item ${item.numeroItem} (Criado por: ${userName})`,
+                ticketNumber: ticket.numero,
+                nomeCliente: ticket.nomeCliente || '',
+                item: String(item.numeroItem),
+                qtde: String(item.quantidade || ''),
+                motivo: item.motivo ? item.motivo.join(' / ') : '',
+                origemDefeito: item.origemDefeito || '',
+                disposicao: item.disposicao || '',
+                disposicaoPecas: item.disposicaoPecas || '',
+                dataGeracao: dataGeracaoFormatada // Envia a data bonita para a coluna Data de Geração!
+            };
+
+            if (item.fotos) {
+                item.fotos.forEach((fotoPath, fIdx) => {
+                    if (fIdx < 10) {
+                        const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(fotoPath);
+                        rowData[`foto${fIdx + 1}`] = data.publicUrl;
+                    }
+                });
+            }
+            return rowData;
+        }) : [];
+
+        if (listData.length > 0) {
+            await this.uploadWithRetries('upload-list-data', { listData });
+        }
+        
+        this.showToast('success', 'Salvo no Share Point');
+
+    } catch (apiError: any) {
+        this.showToast('error', 'Erro ao salvar no Share Point. Tentando download local.');
+        
+        try {
+            const fallbackPdf = new jsPDF('p', 'mm', 'a4');
+            const w = fallbackPdf.internal.pageSize.getWidth();
+            const h = fallbackPdf.internal.pageSize.getHeight();
+            let currentY = 15;
+            this.addHeader(fallbackPdf, w, currentY);
+            currentY += 20;
+            currentY = this.addTicketInfo(fallbackPdf, ticket, currentY, w);
+            currentY += 10;
+            if (ticket.itens && ticket.itens.length > 0) {
+                await this.addItemsList(fallbackPdf, ticket.itens, currentY, w, h);
+            }
+            this.addFooter(fallbackPdf, w, h, userName);
+            
+            const fileName = this.generateFileName(ticket.numero);
+            fallbackPdf.save(fileName);
+        } catch (localPdfError) {
+        }
+    }
+  }
+
+  private generateAndUploadOnlyPdf = async (ticket: Ticket) => {
+      const pdf = new jsPDF('p', 'mm', 'a4');
+      const w = pdf.internal.pageSize.getWidth();
+      const h = pdf.internal.pageSize.getHeight();
+      let y = 15;
+      this.addHeader(pdf, w, y); 
+      y += 20;
+      y = this.addTicketInfo(pdf, ticket, y, w); 
+      y += 10;
+      if (ticket.itens && ticket.itens.length > 0) {
+          y = await this.addItemsList(pdf, ticket.itens, y, w, h);
+      }
+      this.addFooter(pdf, w, h, ticket.responsavel);
+      
+      const fileName = this.generateFileName(ticket.numero);
+      const fileBase64 = pdf.output('datauristring').split(',')[1];
+      
+      await this.uploadWithRetries('upload-pdf', {
+          fileName: fileName, 
+          fileBase64: fileBase64, 
+          ticketNumber: ticket.numero, 
+          ticketTitle: ticket.titulo, 
+          isReport: false
+      });
+
+      const criadorNome = (ticket as any).responsavel_nome || ticket.responsavel || 'Sistema';
+      
+      const agora = new Date();
+      const dataGeracaoFormatada = `${agora.toLocaleDateString('pt-BR')} ${agora.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`;
+
+
+      const listData = ticket.itens ? ticket.itens.map(item => {
+          const rowData: any = {
+              Title: `Laudo ${ticket.numero} - Item ${item.numeroItem} (Criado por: ${criadorNome})`,
+              ticketNumber: ticket.numero,
+              nomeCliente: ticket.nomeCliente || '',
+              item: String(item.numeroItem),
+              qtde: String(item.quantidade || ''),
+              motivo: item.motivo ? item.motivo.join(' / ') : '',
+              origemDefeito: item.origemDefeito || '',
+              disposicao: item.disposicao || '',
+              disposicaoPecas: item.disposicaoPecas || '',
+              dataGeracao: dataGeracaoFormatada
+          };
+
+          if (item.fotos) {
+              item.fotos.forEach((fotoPath, fIdx) => {
+                  if (fIdx < 10) {
+                      const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(fotoPath);
+                      rowData[`foto${fIdx + 1}`] = data.publicUrl;
+                  }
+              });
+          }
+          return rowData;
+      }) : [];
+
+      if (listData.length > 0) {
+          await this.uploadWithRetries('upload-list-data', { listData });
+      }
+  }
+
+  private uploadWithRetries = async (endpoint: string, body: object, retries = 3, initialDelay = 2000) => {
+    let attempt = 0;
+    while (attempt < retries) {
+      try {
+        const response = await fetch(`${this.apiUrl}/${endpoint}`, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json', 
+            'Accept': 'application/json' 
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (response.ok) {
+          const result = await response.json();
+          if (result.success) return result;
+        }
+        throw new Error(`Falha na API: Status ${response.status}`);
+      } catch (error) {
+        attempt++;
+        if (attempt >= retries) throw error;
+        const delayTime = initialDelay * Math.pow(2, attempt - 1);
+        await delay(delayTime);
+      }
+    }
+  }
+  
+  private generateFileName = (ticketNumero: string): string => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    const cleanTicketNumber = ticketNumero.replace(/[^a-zA-Z0-9-]/g, ''); 
+    return `Laudo - ${cleanTicketNumber}-${year}${month}${day} ${hours}${minutes}.pdf`;
+  }
+
+  private addHeader = (pdf: jsPDF, pageWidth: number, y: number): void => {
+    try {
+      const logoUrl = 'https://i.postimg.cc/bJ3kwSbw/DPF.png';
+      pdf.addImage(logoUrl, 'PNG', 21, y - 5, 23, 12);
+    } catch (error) {
+      pdf.setFontSize(10).setFont('helvetica', 'bold').setTextColor(0, 51, 102);
+      pdf.text('DPF', 15, y + 2);
+    }
+    pdf.setFontSize(16).setFont('helvetica', 'bold').setTextColor(0, 0, 0);
+    pdf.text('Laudo Técnico de Garantia', pageWidth / 2, y, { align: 'center' });
+    pdf.setDrawColor(220, 220, 220).setLineWidth(0.5);
+    pdf.line(15, y + 10, pageWidth - 15, y + 10);
+  }
+
+  private addField = (pdf: jsPDF, y: number, label: string, value: string, pageWidth: number): number => {
+    pdf.setFontSize(10);
+    pdf.setFont('helvetica', 'bold').setTextColor(50, 50, 50);
+    pdf.text(label, 15, y);
+    const labelWidth = pdf.getStringUnitWidth(label) * pdf.getFontSize() / pdf.internal.scaleFactor;
+    const valueX = 15 + labelWidth + 2;
+    pdf.setFont('helvetica', 'normal').setTextColor(80, 80, 80);
+    const valueAvailableWidth = pageWidth - valueX - 15;
+    const valueLines = pdf.splitTextToSize(value || 'Não informado', valueAvailableWidth);
+    pdf.text(valueLines, valueX, y);
+    return y + (valueLines.length * 5) + 3;
+  }
+
+  private addTicketInfo = (pdf: jsPDF, ticket: Ticket, y: number, pageWidth: number): number => {
+    pdf.setFontSize(14).setFont('helvetica', 'bold').setTextColor(0, 0, 0);
+    pdf.text('INFORMAÇÕES DO LAUDO', 15, y);
+    y += 8;
+    y = this.addField(pdf, y, 'Número do Ticket:', ticket.numero, pageWidth);
+    y = this.addField(pdf, y, 'Nome do Cliente:', ticket.nomeCliente || 'Não informado', pageWidth);
+    return y;
+  }
+
+  private addItemsList = async (pdf: jsPDF, itens: Ticket['itens'], y: number, pageWidth: number, pageHeight: number): Promise<number> => {
+    pdf.setFontSize(14).setFont('helvetica', 'bold').setTextColor(0, 0, 0);
+    pdf.text('ITENS DO LAUDO', 15, y);
+    y += 10;
+    for (let i = 0; i < itens.length; i++) {
+      const item = itens[i];
+      let itemStartY = y;
+      const estimatedHeight = 80 + (item.fotos && item.fotos.length > 0 ? 60 : 0);
+      if (itemStartY + estimatedHeight > pageHeight - 20) {
+        pdf.addPage();
+        y = 20;
+        itemStartY = y;
+      }
+      pdf.setDrawColor(0, 51, 102).setFillColor(240, 248, 255);
+      pdf.roundedRect(15, itemStartY - 5, pageWidth - 30, 10, 2, 2, 'FD');
+      pdf.setFontSize(12).setFont('helvetica', 'bold').setTextColor(0, 31, 63);
+      pdf.text(`ITEM: ${item.numeroItem}`, 20, itemStartY);
+      pdf.setFontSize(9).setFont('helvetica', 'normal').setTextColor(100, 100, 100);
+      pdf.text(`Quantidade: ${item.quantidade}`, pageWidth - 20, itemStartY, { align: 'right' });
+      y += 10;
+      const motivosString = item.motivo.join('\n'); 
+      
+      const origemFormatada = item.origemDefeito 
+        ? item.origemDefeito.replace(/(\d+):\s*-\s*/, ' $1 - ')
+        : item.origemDefeito;
+
+      const disposicaoPecasFormatada = item.disposicaoPecas
+        ? item.disposicaoPecas.replace(/(\d+)-\s*/, ' $1 - ')
+        : item.disposicaoPecas;
+
+      y = this.addField(pdf, y, 'Motivo:', motivosString, pageWidth); 
+      y = this.addField(pdf, y, 'Origem do Defeito:', origemFormatada, pageWidth);
+      y = this.addField(pdf, y, 'Disposição:', item.disposicao, pageWidth);
+      y = this.addField(pdf, y, 'Disposição das Peças:', disposicaoPecasFormatada, pageWidth);
+      
+      if (item.anotacoes) {
+        y = this.addField(pdf, y, 'Anotações:', item.anotacoes, pageWidth);
+      }
+      y += 3;
+      if (item.fotos && item.fotos.length > 0) {
+        const photoSize = 45;
+        const gap = 4;
+        const photosPerRow = 4;
+        let photoX = 15;
+        if (y + photoSize > pageHeight - 20) {
+          pdf.addPage();
+          y = 20;
+        }
+        pdf.setFontSize(10).setFont('helvetica', 'bold').setTextColor(50, 50, 50);
+        pdf.text('Fotos:', 15, y);
+        y += 7;
+        
+        const imageBase64Strings = await Promise.all(
+            item.fotos.map(path => fetchImageAsBase64(path))
+        );
+
+        for(let p = 0; p < imageBase64Strings.length; p++) {
+          const fotoBase64 = imageBase64Strings[p];
+          if (p > 0 && p % photosPerRow === 0) {
+            y += photoSize + gap;
+            photoX = 15;
+            if (y + photoSize > pageHeight - 20) {
+              pdf.addPage();
+              y = 20;
+            }
+          }
+          
+          if (fotoBase64) { 
+            try {
+              pdf.addImage(fotoBase64, 'JPEG', photoX, y, photoSize, photoSize);
+              pdf.setDrawColor(200, 200, 200).rect(photoX, y, photoSize, photoSize);
+            } catch (e) {
+              pdf.setFontSize(8).setTextColor(150, 0, 0);
+              pdf.text('[img erro]', photoX + photoSize / 2, y + photoSize / 2, { align: 'center' });
+            }
+          } else {
+            pdf.setDrawColor(150, 0, 0).rect(photoX, y, photoSize, photoSize);
+            pdf.setFontSize(8).setTextColor(150, 0, 0);
+            pdf.text('[img erro]', photoX + photoSize / 2, y + photoSize / 2, { align: 'center' });
+          }
+          photoX += photoSize + gap;
+        }
+        y += photoSize + 10;
+      }
+      if (i < itens.length - 1) {
+        pdf.setDrawColor(220, 220, 220).setLineWidth(0.3);
+        pdf.line(15, y, pageWidth - 15, y);
+        y += 10;
+      }
+    }
+    return y;
+  }
+
+  private addFooter = (pdf: jsPDF, pageWidth: number, pageHeight: number, userName: string): void => {
+    const totalPages = (pdf as any).internal.getNumberOfPages();
+    for (let i = 1; i <= totalPages; i++) {
+      pdf.setPage(i);
+      pdf.setDrawColor(220, 220, 220).setLineWidth(0.5);
+      pdf.line(15, pageHeight - 15, pageWidth - 15, pageHeight - 15);
+      pdf.setFontSize(8).setFont('helvetica', 'normal').setTextColor(100, 100, 100);
+      pdf.text('DPF AUTO PEÇAS LTDA - Sistema de Laudos', 15, pageHeight - 10);
+      pdf.text(`Página ${i} de ${totalPages}`, pageWidth / 2, pageHeight - 10, { align: 'center' });
+      const dataGeracao = new Date().toLocaleString('pt-BR');
+      pdf.text(`Gerado por ${userName} em ${dataGeracao}`, pageWidth - 15, pageHeight - 10, { align: 'right' });
+    }
+  }
+}
+
+export const pdfGenerator = PDFGenerator.getInstance();
