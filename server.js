@@ -21,7 +21,7 @@ app.use(bodyParser.json({ limit: '50mb' }));
 
 console.log('🚀 API SharePoint DPF a iniciar...');
 
-// Mapeamento DEFINITIVO com a coluna Data de Geração exata
+// Mapeamento DEFINITIVO com "Data de Geração" e "Responsável"
 const COLUMN_MAPPING = {
     'Title': (row) => row.Title,
     'field_1': (row) => row.ticketNumber,
@@ -42,7 +42,8 @@ const COLUMN_MAPPING = {
     'field_16': (row) => row.foto8 || null,
     'field_17': (row) => row.foto9 || null,
     'field_18': (row) => row.foto10 || null,
-    'Datadegera_x00e7__x00e3_o': (row) => row.dataGeracao || '' // <-- Aqui está o código mágico!
+    'Datadegera_x00e7__x00e3_o': (row) => row.dataGeracao || '', // Coluna Data
+    'Respons_x00e1_vel': (row) => row.responsavel || ''        // Coluna Responsável
 };
 
 async function getAccessToken(retries = 3) {
